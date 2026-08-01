@@ -1,7 +1,7 @@
 # Coding Standards
 
 ## Overview
-This document outlines the coding standards and best practices for the Improv Today project.
+This document outlines the coding standards and best practices for the Clara project.
 
 ## General Principles
 

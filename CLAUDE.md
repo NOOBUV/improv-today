@@ -1,2 +1,4 @@
-- docker for improv-today-backend automatically picks changes and reloads.
-- my docker images auto build as it has script which detects changes in code and rebuilds image you don't have to restart it for code changes.
+- Project: Clara, the Digital Companion (folders keep the legacy improv-today-* names; each is its own GitHub repo).
+- Backend dev runs in docker (`docker compose up` in improv-today-backend). Python code hot-reloads via the `./:/app` bind mount + `uvicorn --reload` — no image rebuild needed for code changes. Changes to requirements.txt or the Dockerfile DO need `docker compose up -d --build`.
+- Frontend runs on the host: `npm run dev` in improv-today-frontend (port 3000).
+- Run backend tests inside the container: `docker compose exec -T backend python -m pytest tests/ -q`.

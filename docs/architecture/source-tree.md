@@ -1,7 +1,7 @@
 # Source Tree Structure
 
 ## Overview
-This document describes the organizational structure of the Improv Today project repository.
+This document describes the organizational structure of the Clara project repository.
 
 ## Root Directory Structure
 

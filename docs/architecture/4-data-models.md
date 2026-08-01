@@ -10,9 +10,9 @@ To support the simulation engine, we will need to introduce new tables to our Po
   * `timestamp` (DateTime)
   * `status` (String: 'unprocessed', 'processed')
 
-### **`AvaGlobalState` Table**
+### **`ClaraGlobalState` Table**
 
-This holds Ava's core, persistent state.
+This holds Clara's core, persistent state.
 
   * `state_id` (PK)
   * `trait_name` (String, Unique: e.g., 'stress', 'energy', 'mood')
