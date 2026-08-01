@@ -1,0 +1,2 @@
+- docker for improv-today-backend automatically picks changes and reloads.
+- my docker images auto build as it has script which detects changes in code and rebuilds image you don't have to restart it for code changes.

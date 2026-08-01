@@ -1,0 +1,10 @@
+# App repos have their own git
+improv-today-backend/
+improv-today-frontend/
+# Noise
+.DS_Store
+web-bundles/
+.bmad-core/
+.codex/
+.cursor/
+.superdesign/
