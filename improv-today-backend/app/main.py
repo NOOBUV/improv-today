@@ -1,0 +1,95 @@
+import logging
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import os
+from app.api import clara, subscriptions, state
+from app.api.simulation import admin as simulation_admin
+from app.api.admin import journal as admin_journal
+from app.core.config import settings
+from app.middleware.subscription_middleware import SubscriptionMiddleware
+
+app = FastAPI(
+    title="Clara API",
+    version="1.0.0",
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
+)
+
+# CORS middleware
+# CORS origins from env (comma-separated), fallback to common localhost dev origins
+cors_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://frontend:3000")
+allow_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add subscription middleware for handling subscription-required responses
+app.add_middleware(SubscriptionMiddleware)
+
+# Include routers
+app.include_router(clara.router, prefix="/api/clara", tags=["clara"])
+app.include_router(subscriptions.router, prefix="/api", tags=["subscriptions"])
+
+# Simulation engine admin routes
+app.include_router(simulation_admin.router, prefix="/api/simulation", tags=["simulation"])
+
+# Admin journal routes
+app.include_router(admin_journal.router, prefix="/api", tags=["admin"])
+
+
+# State management routes
+app.include_router(state.router, tags=["state"])
+
+
+@app.get("/")
+async def root():
+    return {"message": "Clara API"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on application startup"""
+    logger = logging.getLogger("app.startup")
+    logger.info("Initializing Clara backend services...")
+    
+    # Import models to ensure they're registered with Base
+    from app.models import user, clara_state
+    # Models imported for SQLAlchemy registration
+    
+    # Initialize database tables
+    from app.core.database import create_tables, check_connection, ensure_dev_sqlite_columns
+    if check_connection():
+        # In production, rely on Alembic migrations
+        if settings.is_development:
+            create_tables()
+            # Dev convenience: add columns for SQLite if missing
+            ensure_dev_sqlite_columns()
+        logger.info("Database tables initialized")
+    else:
+        logger.error("Database connection failed")
+    
+    # API endpoints ready
+    logger.info("HTTP API endpoints available:")
+    logger.info("  - /api/clara - Main conversation endpoint")
+
+    logger.info("Clara backend startup complete")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup services on application shutdown"""
+    logger = logging.getLogger("app.shutdown")
+    logger.info("Shutting down Clara backend services...")
+    
+    # Cleanup would go here if needed
+    logger.info("Clara backend shutdown complete")
