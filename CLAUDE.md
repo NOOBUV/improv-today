@@ -1,4 +1,7 @@
-- Project: Clara, the Digital Companion (folders keep the legacy improv-today-* names; each is its own GitHub repo).
+- Project: Clara, the Digital Companion. Single **monorepo** (`improv-today`) containing `improv-today-backend/` and `improv-today-frontend/` — folders keep the legacy improv-today-* names. One git repo at the root; the subfolders are plain directories, not submodules.
+- The old per-project GitHub repos (`NOOBUV/improv-today-backend`, `NOOBUV/improv-today-frontend`) are **frozen backups** — don't push there. Their full histories were imported into this monorepo. Local copies of their old `.git` dirs live at `~/Desktop/Learning/improv-today-git-backups/`.
+- Run commands are unchanged — they're just run from inside the respective subfolder.
+- CI: `.github/workflows/deploy-backend.yml` at the repo root, triggered only on `improv-today-backend/**` changes.
 - Backend dev runs in docker (`docker compose up` in improv-today-backend). Python code hot-reloads via the `./:/app` bind mount + `uvicorn --reload` — no image rebuild needed for code changes. Changes to requirements.txt or the Dockerfile DO need `docker compose up -d --build`.
 - Frontend runs on the host: `npm run dev` in improv-today-frontend (port 3000).
 - Run backend tests inside the container: `docker compose exec -T backend python -m pytest tests/ -q`.
