@@ -1,8 +1,31 @@
-# App repos have their own git
-improv-today-backend/
-improv-today-frontend/
+# Monorepo root. Each subproject keeps its own .gitignore; these are safety nets
+# that apply at any depth.
+
+# Secrets
+.env
+.env.*
+!.env*.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Local model weights (Kokoro voice server)
+voice/models/
+
 # Noise
 .DS_Store
+.playwright-mcp/
 web-bundles/
 .bmad-core/
 .codex/
