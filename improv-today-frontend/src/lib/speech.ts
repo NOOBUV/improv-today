@@ -209,7 +209,14 @@ export class BrowserSpeechService {
     }
 
     if (!last) return;
-    // stop() also fires 'ended', so a barge-in resolves this instead of hanging the turn.
+    // The stream can close *after* its last chunk has already played out: the voice server
+    // yields the final PCM and only then spends one more model step before ending the response
+    // (voice/app.py::_qwen_worker). 'ended' has fired by then, so attaching the listener here
+    // waits for an event that already happened — the turn hangs, isCurrentlySpeaking stays
+    // true, onComplete never fires, and the half-duplex mic stays gated for good.
+    // scheduleChunk's own 'ended' listener drops the source from `scheduled`, so a source
+    // that's gone is a source that finished. stop() fires 'ended' too, so a barge-in lands here.
+    if (!this.scheduled.has(last)) return;
     await new Promise<void>((resolve) => { last!.onended = () => resolve(); });
   }
 

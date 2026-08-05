@@ -32,10 +32,17 @@ type FakeSource = {
   buffer: { getChannelData: () => Float32Array; duration: number } | null;
   onended: (() => void) | null;
   startedAt: number | null;
+  listeners: Array<() => void>;
   connect: jest.Mock;
-  addEventListener: jest.Mock;
+  addEventListener: (type: string, fn: () => void) => void;
   start: (t: number) => void;
   stop: jest.Mock;
+};
+
+/** The audio for this source has played out: fire 'ended' exactly as Web Audio would. */
+const endSource = (src: FakeSource) => {
+  src.listeners.forEach((fn) => fn());
+  src.onended?.();
 };
 const sources: FakeSource[] = [];
 const fakeCtx = {
@@ -53,10 +60,11 @@ const fakeCtx = {
       buffer: null,
       onended: null,
       startedAt: null,
+      listeners: [],
       connect: jest.fn(),
-      addEventListener: jest.fn(),
+      addEventListener: (_type: string, fn: () => void) => { src.listeners.push(fn); },
       start: (t: number) => { src.startedAt = t; },
-      stop: jest.fn(() => src.onended?.()),
+      stop: jest.fn(() => endSource(src)),
     };
     sources.push(src);
     return src;
@@ -120,8 +128,46 @@ describe('Streamed PCM playback', () => {
     expect(sources[0].buffer!.getChannelData()[0]).toBeCloseTo(0.5);
 
     expect(onEnd).not.toHaveBeenCalled(); // still audible until the last chunk plays out
-    sources[1].onended!();
+    endSource(sources[1]);
     await flush();
+    expect(onEnd).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression: the turn used to hang here forever. The voice server yields its final PCM chunk
+  // and only then spends another model step before closing the response, so the audio can play
+  // out before the reader ever sees `done`. Attaching 'ended' after the fact waited for an event
+  // that had already fired — Clara stuck on "Clara Speaking...", the half-duplex mic gated for
+  // good, and the whole conversation frozen. Reproduced in Chrome with a 2s close delay.
+  test('a last chunk that plays out before the stream closes still ends the turn', async () => {
+    let closeStream!: () => void;
+    const closed = new Promise<void>((resolve) => { closeStream = resolve; });
+    let sent = false;
+    fetchMock.mockResolvedValue({
+      ok: true,
+      headers: { get: (k: string) => (k === 'X-Sample-Rate' ? '24000' : 'application/octet-stream') },
+      body: {
+        getReader: () => ({
+          read: async () => {
+            if (!sent) { sent = true; return { done: false, value: pcm(new Array(2400).fill(1000)) }; }
+            await closed; // the generator's last model step, after all audio is out
+            return { done: true, value: undefined };
+          },
+          cancel: async () => {},
+        }),
+      },
+    } as unknown as Response);
+
+    const onEnd = jest.fn();
+    speechService['isCurrentlySpeaking'] = true;
+    speechService['speakChunk']('Oh.', {}, onEnd);
+    await flush();
+
+    expect(sources).toHaveLength(1);
+    endSource(sources[0]); // audio finished while the server was still winding down
+    await flush();
+    closeStream();
+    await flush();
+
     expect(onEnd).toHaveBeenCalledTimes(1);
   });
 
