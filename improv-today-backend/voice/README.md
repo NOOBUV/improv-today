@@ -1,8 +1,10 @@
-# Clara voice server (Qwen3-TTS, Kokoro fallback)
+# Clara voice server (Qwen3-TTS out, Parakeet in)
 
-Local, host-side text-to-speech so Clara has a real voice instead of the browser's
-robot. Runs OUTSIDE docker on purpose — the models are GBs and have no business
-in the prod API image.
+Local, host-side speech so Clara has a real voice instead of the browser's robot, and
+hears you without shipping the audio to Google. Runs OUTSIDE docker on purpose — the
+models are GBs and have no business in the prod API image.
+
+## TTS
 
 Two engines, both loaded:
 
@@ -34,13 +36,15 @@ paying warm-up cost: ~10s once the weights are on disk, minutes on the first-eve
 
 ## API
 
-- `GET /health` → adds `streaming` and `streaming_endpoint` to the engine readiness above
-  (`engine` is whichever is tried first; `qwen3` reads `unavailable (...)` if it failed to load)
+- `GET /health` → engine readiness (`engine` is whichever is tried first; `qwen3` reads
+  `unavailable (...)` if it failed to load), plus `streaming`/`streaming_endpoint` and the
+  `stt_*` fields the browser gates its local-STT path on
 - `POST /v1/audio/speech/stream` → **the fast path.** Raw PCM `s16le` mono, one chunk per
   ~`STREAM_INTERVAL_S` of audio, sample rate in the `X-Sample-Rate` header,
   `Content-Type: application/octet-stream`. Not WAV: a header written before the length is
   known is a lie the client then has to un-believe.
 - `POST /v1/audio/speech` → the whole WAV in one response. Kept for callers that can't stream.
+- `POST /v1/audio/transcriptions` → audio in, transcript out. See **STT** below.
 
 Both take the same OpenAI-shaped body plus an emotion:
 `{"input": "...", "emotion": "calm", "voice": "af_heart", "speed": 1.0}`
@@ -64,7 +68,50 @@ whole-WAV endpoint only. The deadline starts when the generation actually owns t
 when the request arrived — otherwise a prefetched sentence queued behind its predecessor would
 fail it every time.
 
+## STT
+
+`POST /v1/audio/transcriptions` — **raw 16-bit mono WAV bytes as the request body**, not
+multipart, despite the OpenAI-shaped path. One caller, one format, and it skips the
+python-multipart dependency. Answers `{"text": "..."}`. 400 on an empty body, 413 past
+`MAX_AUDIO_S` (60s), 422 if the audio won't decode.
+
+`mlx-community/parakeet-tdt-0.6b-v2`, loaded on the **first transcription**, not at startup —
+a session that only ever speaks never pays the ~1.3s load or the ~0.9GB. It runs on one
+dedicated worker thread, because MLX streams are thread-local: a model loaded on one thread
+raises `no Stream(cpu, 1) in current thread` when run from another. That single worker also
+serializes STT for free, so there is no lock, and it never shares `synth_lock` — a prefetched
+TTS sentence must not queue behind the transcript that asked for it.
+
+Warm, on an M2 with Qwen3 also resident: **~0.20s to transcribe a 5s utterance**; ~0.7s for
+the first request after the GPU has been idle a while. Measured against
+`mlx-community/whisper-large-v3-turbo` on the same 6.4s clip: 0.24s vs 2.29s warm, identical
+transcript, 0.9GB vs 1.6GB resident. Parakeet is the smaller *and* faster one, which on 16GB
+shared with a 2.3GB TTS model settles it. Parakeet is English-only; that is the trade.
+
+```
+.venv/bin/python check_stt.py     # Clara says a sentence, Clara transcribes it back
+```
+
 ## How the frontend uses it
+
+### Hearing (`src/lib/localSpeech.ts` + `vad.ts`)
+
+The browser records the mic through a `ScriptProcessorNode` at 16kHz, computes RMS energy per
+64ms frame, and hands it to `EnergyVad` — a small state machine that calibrates to the room's
+noise floor for 400ms, then calls the utterance over after 800ms of silence. That replaces the
+1.8s "Chrome stopped sending interim results" watchdog, which measured the *recogniser* going
+quiet rather than the *user*, and is the reason the UI used to stick on "Listening...". On
+`end` it encodes the samples (plus ~380ms of pre-roll, or the first syllable is clipped) as a
+WAV and POSTs them here.
+
+`SimpleSpeech.startListening` picks the path: local if `config.localStt.enabled` and this
+server answers `/health`, otherwise Chrome's Web Speech API — the same
+local-first-then-browser shape as TTS. A failed transcription marks local down for the rest of
+the page load and the next turn goes to Chrome. `NEXT_PUBLIC_LOCAL_STT=false` turns it off
+entirely. Either way the caller sees one final result and a resolved promise, so
+`SpeechInterface` needed no changes at all.
+
+### Speaking (`src/lib/speech.ts`)
 
 `BrowserSpeechService` (frontend `src/lib/speech.ts`) POSTs each sentence to the streaming
 endpoint and schedules the PCM chunks back-to-back through Web Audio, so Clara starts talking
@@ -84,5 +131,7 @@ and must expose `X-Sample-Rate` or the browser can't decode what it's given.
   it stays servable while an abandoned Qwen3 generation winds down.
 - Qwen3 occasionally rambles on low-energy lines, so generation is capped at `MAX_TOKENS`
   (~20s of audio at the 12Hz codec rate) and the whole call at `SYNTH_TIMEOUT_S`.
-- Parakeet STT can live in this same app later — same venv, add a `/v1/audio/transcriptions`
-  route. That's the reason this is a standalone FastAPI app and not a script.
+- Energy VAD cannot tell speech from a door slam. If a real room defeats the constants in
+  `vad.ts`, the upgrade is silero via `@ricky0123/vad-web` behind the same `push()` interface —
+  not a rewrite of the caller. Tune the constants first; a dependency that ships a neural net
+  is not the first thing you reach for.

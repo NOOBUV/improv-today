@@ -1,5 +1,6 @@
 kokoro-onnx
 mlx-audio
+parakeet-mlx
 soundfile
 fastapi
 uvicorn[standard]

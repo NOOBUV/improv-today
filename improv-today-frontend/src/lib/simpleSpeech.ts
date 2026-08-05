@@ -1,3 +1,6 @@
+import { config } from './config';
+import { LocalSpeech, MicPermissionError, localSttAvailable, markLocalSttDown } from './localSpeech';
+
 export type SpeechListener = (result: { transcript: string; isFinal: boolean }) => void;
 
 // Minimal DOM type guards for browsers that expose webkit speech recognition
@@ -16,7 +19,8 @@ export class SimpleSpeech {
   private recognition?: AnySpeechRecognition;
   private isSpeaking = false;
   private preferredVoice?: SpeechSynthesisVoice;
-  
+  private local = new LocalSpeech();
+
 
   constructor() {
     type SpeechWindow = {
@@ -62,7 +66,9 @@ export class SimpleSpeech {
   }
 
   public canListen(): boolean {
-    return !!this.recognition;
+    // Whether the local server is actually up is only knowable asynchronously; startListening
+    // finds out and falls back. This just says "some path exists".
+    return !!this.recognition || config.localStt.enabled;
   }
 
   public async speak(text: string): Promise<void> {
@@ -88,7 +94,26 @@ export class SimpleSpeech {
   }
 
   public async startListening(onResult: SpeechListener): Promise<void> {
-    if (!this.recognition || this.isSpeaking) return;
+    if (this.isSpeaking) return;
+
+    // Local first: real VAD decides when the utterance ended, and the audio never leaves the
+    // machine. Mirrors how speech.ts prefers the local voice server over speechSynthesis.
+    if (config.localStt.enabled && (await localSttAvailable())) {
+      try {
+        const text = await this.local.listenOnce();
+        // One final result, then resolve — same contract as Chrome's continuous:false session.
+        if (text) onResult({ transcript: text, isFinal: true });
+        return;
+      } catch (e) {
+        if (e instanceof MicPermissionError) throw e; // Chrome would fail on this too
+        console.warn('Local STT failed, falling back to Chrome Web Speech:', e);
+        markLocalSttDown();
+      }
+    }
+
+    if (!this.recognition) {
+      throw new Error('Speech recognition unavailable. Start the local voice server, or use Chrome/Edge.');
+    }
 
     // Ensure microphone permission (Brave and some Chromium derivatives require this)
     try {
@@ -149,6 +174,7 @@ export class SimpleSpeech {
   }
 
   public async stopListening(): Promise<void> {
+    this.local.stop(); // no-op unless a capture or transcription is in flight
     if (!this.recognition) return;
     try {
       this.recognition.stop();

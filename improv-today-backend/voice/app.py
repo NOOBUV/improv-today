@@ -1,19 +1,23 @@
-"""Local TTS server for Clara. Host-side only — deliberately not part of the API image.
+"""Local voice server for Clara. Host-side only — deliberately not part of the API image.
 
-Qwen3-TTS (emotion-conditioned, MLX) is the voice; Kokoro stays loaded as the fallback
+TTS: Qwen3-TTS (emotion-conditioned, MLX) is the voice; Kokoro stays loaded as the fallback
 for when Qwen3 fails or runs long.
+STT: Parakeet, loaded on first use so a TTS-only session never pays for it.
 """
 
+import asyncio
 import io
 import logging
 import queue
+import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from kokoro_onnx import Kokoro
@@ -88,6 +92,34 @@ except Exception as exc:  # missing weights, no metal, OOM — Kokoro still serv
 # is still winding down.
 synth_lock = threading.Lock()
 kokoro_lock = threading.Lock()
+
+# Parakeet over mlx-whisper-large-v3-turbo, measured on the same 6.4s clip of Clara's own
+# voice on this M2: 0.24s vs 2.29s warm, identical transcript, 0.9GB vs 1.6GB resident.
+# Qwen3 already holds ~2.3GB of the 16GB, so the smaller *and* faster one wins twice.
+STT_REPO = "mlx-community/parakeet-tdt-0.6b-v2"
+MAX_AUDIO_S = 60  # 16kHz mono s16 — a browser utterance is capped well under this
+MAX_AUDIO_BYTES = MAX_AUDIO_S * 16000 * 2
+
+_stt = None
+# MLX streams are thread-local: a model loaded on one thread cannot be run from another
+# ("no Stream(cpu, 1) in current thread"). One dedicated worker owns Parakeet from load to
+# every transcription, which serializes STT for free — no separate lock, and no sharing of
+# synth_lock, which would make a prefetched TTS sentence queue behind the transcript that
+# asked for it.
+_stt_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt")
+
+
+def _transcribe_sync(path: str) -> str:
+    """Runs only on _stt_pool's single thread. First call pays the load; TTS-only never does."""
+    global _stt
+    if _stt is None:
+        from parakeet_mlx import from_pretrained  # a second of imports, also deferred
+
+        t0 = time.monotonic()
+        _stt = from_pretrained(STT_REPO)
+        log.info("Parakeet (%s) loaded in %.1fs", STT_REPO, time.monotonic() - t0)
+    return _stt.transcribe(path).text.strip()
+
 
 app = FastAPI(title="Clara Voice")
 app.add_middleware(
@@ -187,7 +219,42 @@ def health() -> dict[str, str]:
         "voice": KOKORO_VOICE,
         "streaming": "ready" if qwen else "unavailable (needs qwen3)",
         "streaming_endpoint": "/v1/audio/speech/stream",
+        # The browser gates its local-STT path on this, so it must answer before the model
+        # has ever been loaded: "loaded" vs "lazy" is a warm/cold hint, not availability.
+        "stt": "loaded" if _stt else "lazy",
+        "stt_model": STT_REPO,
+        "stt_endpoint": "/v1/audio/transcriptions",
     }
+
+
+@app.post("/v1/audio/transcriptions")
+async def transcriptions(request: Request) -> dict[str, str]:
+    """Raw 16-bit WAV bytes in the body, transcript out.
+
+    ponytail: body bytes, not multipart — one caller, one format, and it skips the
+    python-multipart dependency. Not OpenAI wire-compatible despite the path.
+    """
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(400, "empty body")
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(413, f"audio over {MAX_AUDIO_S}s")
+
+    started = time.monotonic()
+    # parakeet-mlx takes a path, not an array — the temp file is the whole reason it exists.
+    with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+        f.write(audio)
+        f.flush()
+        try:
+            text = await asyncio.get_running_loop().run_in_executor(
+                _stt_pool, _transcribe_sync, f.name
+            )
+        except Exception as exc:  # undecodable audio, or MLX giving up
+            log.warning("STT failed on %d bytes: %s: %s", len(audio), type(exc).__name__, exc)
+            raise HTTPException(422, f"could not transcribe: {type(exc).__name__}") from exc
+
+    log.info("stt %.2fs %.1fs-audio %r", time.monotonic() - started, len(audio) / 32000, text[:60])
+    return {"text": text}
 
 
 @app.post("/v1/audio/speech/stream")
