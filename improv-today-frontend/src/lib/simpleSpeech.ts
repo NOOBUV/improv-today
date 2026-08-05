@@ -65,6 +65,16 @@ export class SimpleSpeech {
     }
   }
 
+  /** True while a hands-free local session owns the mic. The Chrome fallback is tap-to-talk. */
+  public get continuous(): boolean {
+    return this.local.active;
+  }
+
+  /** Half-duplex gate. No-op on the Chrome path, which never holds the mic mid-reply. */
+  public setMicGated(gated: boolean): void {
+    this.local.setGated(gated);
+  }
+
   public canListen(): boolean {
     // Whether the local server is actually up is only knowable asynchronously; startListening
     // finds out and falls back. This just says "some path exists".
@@ -96,13 +106,13 @@ export class SimpleSpeech {
   public async startListening(onResult: SpeechListener): Promise<void> {
     if (this.isSpeaking) return;
 
-    // Local first: real VAD decides when the utterance ended, and the audio never leaves the
-    // machine. Mirrors how speech.ts prefers the local voice server over speechSynthesis.
+    // Local first: real VAD decides when each utterance started and ended, and the audio never
+    // leaves the machine. Mirrors how speech.ts prefers the local voice server over speechSynthesis.
     if (config.localStt.enabled && (await localSttAvailable())) {
       try {
-        const text = await this.local.listenOnce();
-        // One final result, then resolve — same contract as Chrome's continuous:false session.
-        if (text) onResult({ transcript: text, isFinal: true });
+        // Hands-free: this resolves only when stopListening() ends the session. Every utterance
+        // arrives as one final result — the same contract as before, just more of them.
+        await this.local.listen((text) => onResult({ transcript: text, isFinal: true }));
         return;
       } catch (e) {
         if (e instanceof MicPermissionError) throw e; // Chrome would fail on this too

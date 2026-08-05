@@ -19,6 +19,8 @@ interface SpeechInterfaceProps {
 
 interface SpeechInterfaceRef {
   handleToggle: () => void;
+  /** Hands-free session live? Then nothing needs restarting between turns. */
+  isContinuous: () => boolean;
 }
 
 export const SpeechInterface = memo(forwardRef<SpeechInterfaceRef, SpeechInterfaceProps>(function SpeechInterface({ onTranscriptComplete, disabled = false, aiResponse, onAudioStream, hidden = false }, ref) {
@@ -52,7 +54,25 @@ export const SpeechInterface = memo(forwardRef<SpeechInterfaceRef, SpeechInterfa
 
   useEffect(() => {
     speechRef.current = new SimpleSpeech();
+    // The hands-free mic outlives a turn, so it has to die with the component.
+    return () => void speechRef.current?.stopListening();
   }, []);
+
+  // Half-duplex: while Clara is thinking or talking the mic is shut, so her own voice can't
+  // open the next turn. It re-arms the instant she's done — no press. The visible state stays
+  // truthful: a gated mic is not "listening".
+  // ponytail: no barge-in. Interrupting her mid-reply is the deliberate non-goal — it needs the
+  // mic live *under* her own audio, which the browser's echoCancellation doesn't cover for TTS
+  // played through Web Audio (it cancels the far end of a WebRTC call, not our own graph).
+  // Upgrade path: keep the VAD running while she speaks with an AEC reference tapped off the
+  // playback graph, and cancel playback on detected speech instead of gating.
+  const micGated = disabled || isAISpeaking;
+  useEffect(() => {
+    const speech = speechRef.current;
+    if (!speech?.continuous) return;
+    speech.setMicGated(micGated);
+    setListening(!micGated);
+  }, [micGated, setListening]);
 
   const stopSilenceTimer = useCallback(() => {
     if (silenceTimerRef.current) {
@@ -122,6 +142,16 @@ export const SpeechInterface = memo(forwardRef<SpeechInterfaceRef, SpeechInterfa
         }
 
         const text = t.trim();
+
+        // Hands-free: the VAD already decided this utterance ended. Send it and keep the mic
+        // open — no silence watchdog, no teardown, no button. lastHeardRef stays empty so the
+        // end-of-session handler below can't send the same turn twice.
+        if (speech.continuous) {
+          setTranscript(text, false);
+          if (text) onTranscriptComplete(text);
+          return;
+        }
+
         lastHeardRef.current = text;
 
         if (isFinal) {
@@ -149,7 +179,7 @@ export const SpeechInterface = memo(forwardRef<SpeechInterfaceRef, SpeechInterfa
         onAudioStream(null);
       }
     }
-  }, [clearTranscript, setListening, setError, setTranscript, armSilenceTimer, handleFinalTranscript, onAudioStream]);
+  }, [clearTranscript, setListening, setError, setTranscript, armSilenceTimer, handleFinalTranscript, onAudioStream, onTranscriptComplete]);
 
   // Handle AI response - speak it and auto-restart listening
   const lastProcessedResponse = useRef<string>('');
@@ -175,6 +205,15 @@ export const SpeechInterface = memo(forwardRef<SpeechInterfaceRef, SpeechInterfa
 
   const handleToggle = async () => {
     if (disabled || isAISpeaking) return;
+
+    // Hands-free session running: one press ends the whole thing. Nothing left to send —
+    // every utterance went out the moment the VAD closed it.
+    if (speechRef.current?.continuous) {
+      manuallyStoppedRef.current = true;
+      await stopListening();
+      setPaused(true);
+      return;
+    }
 
     if (isListening) {
       // On mobile: clicking while listening sends the transcript (manual stop & send)
@@ -216,17 +255,17 @@ export const SpeechInterface = memo(forwardRef<SpeechInterfaceRef, SpeechInterfa
     return 'Tap to talk';
   };
 
+  useImperativeHandle(ref, () => ({
+    handleToggle,
+    isContinuous: () => !!speechRef.current?.continuous,
+  }));
+
   const getStatusText = () => {
     if (isAISpeaking) return 'AI speaking...';
     if (isListening) return 'Listening...';
     if (isPaused) return 'Paused';
     return 'Tap to start';
   };
-
-  // Expose handleToggle to parent components
-  useImperativeHandle(ref, () => ({
-    handleToggle
-  }));
 
   if (hidden) {
     return null; // Hide the interface but keep all functionality

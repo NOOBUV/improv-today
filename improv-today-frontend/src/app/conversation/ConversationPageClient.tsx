@@ -78,7 +78,7 @@ export default function ConversationPage() {
     reducedMotion: false
   });
   const [heartbeatMuted, setHeartbeatMuted] = useState(false);
-  const speechInterfaceRef = useRef<{ handleToggle: () => void } | null>(null);
+  const speechInterfaceRef = useRef<{ handleToggle: () => void; isContinuous: () => boolean } | null>(null);
   const moodTransitionCacheRef = useRef<Map<string, { mood: EmotionalMood; timestamp: number }>>(new Map());
   const performanceMonitorRef = useRef(getPerformanceMonitor());
 
@@ -99,6 +99,9 @@ export default function ConversationPage() {
 
   // Stable function to auto-start listening after Clara speaks
   const autoStartListening = useCallback(() => {
+    // Hands-free (local STT): the mic never closed. SpeechInterface un-gates it the moment
+    // isAISpeaking drops — toggling here would mute the session instead of restarting it.
+    if (speechInterfaceRef.current?.isContinuous?.()) return;
     setTimeout(() => {
       // Safety check: only start listening if Clara is truly done speaking
       if (!isAISpeaking && speechInterfaceRef.current?.handleToggle) {

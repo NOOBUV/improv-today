@@ -93,3 +93,46 @@ export class EnergyVad {
     return 'end';
   }
 }
+
+/** What a hands-free session cares about. 'idle' folds together "nothing yet" and "gated". */
+export type ContinuousEvent = 'idle' | 'speech' | 'end';
+
+/**
+ * Hands-free driver over EnergyVad: one mic session, many turns. Two differences from the
+ * single-shot machine above — an utterance ending re-arms instead of finishing, and silence
+ * never times the session out, because nobody is waiting to press a button again.
+ */
+export class ContinuousVad {
+  private vad: EnergyVad;
+  private gated = false;
+
+  constructor(startMs = 0, private readonly cfg: VadConfig = VAD) {
+    this.vad = new EnergyVad(startMs, cfg);
+  }
+
+  /** Nothing was captured this frame — the caller should not even buffer it. */
+  get isGated(): boolean {
+    return this.gated;
+  }
+
+  /**
+   * Half-duplex: closed while Clara speaks so her own voice cannot open a turn.
+   * Lifting the gate re-arms on the room as it is now, not as it was before she started.
+   */
+  setGated(gated: boolean, nowMs: number) {
+    if (gated === this.gated) return;
+    this.gated = gated;
+    if (!gated) this.vad = new EnergyVad(nowMs, this.cfg);
+  }
+
+  push(rms: number, nowMs: number): ContinuousEvent {
+    if (this.gated) return 'idle';
+    const event = this.vad.push(rms, nowMs);
+    if (event === 'end') {
+      this.vad = new EnergyVad(nowMs, this.cfg); // next turn, immediately
+      return 'end';
+    }
+    // 'timeout' is a single-shot concept: it exists to hand the turn back to a button.
+    return event === 'speech' ? 'speech' : 'idle';
+  }
+}

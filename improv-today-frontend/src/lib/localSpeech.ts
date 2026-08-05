@@ -1,11 +1,12 @@
 'use client';
 
-// Speech-to-text without leaving the machine: capture the mic, let the VAD decide when the
-// utterance ended, POST the audio to the same local voice server that already does TTS.
+// Speech-to-text without leaving the machine: open the mic once, let the VAD decide when each
+// utterance starts and ends, POST the audio to the same local voice server that already does TTS.
+// The mic stays open for the whole conversation — no per-turn button.
 // The Chrome Web Speech API stays as the fallback — see SimpleSpeech.startListening.
 
 import { config } from './config';
-import { EnergyVad } from './vad';
+import { ContinuousVad } from './vad';
 
 const SAMPLE_RATE = 16000; // what Parakeet wants; AudioContext resamples the mic for free
 const FRAME_SIZE = 1024; // 64ms per callback at 16kHz — well under the 800ms hangover
@@ -61,11 +62,17 @@ export function encodeWav(pcm: Float32Array, sampleRate: number): Blob {
   return new Blob([bytes], { type: 'audio/wav' });
 }
 
+type MicSession = {
+  stop(): void;
+  /** Half-duplex: shut the mic while Clara talks, re-arm when she's done. */
+  setGated(gated: boolean): void;
+};
+
 /**
- * Record until the VAD says the utterance is over. Resolves with the samples, or null if
- * nothing was ever said (or the caller aborted). Registers its own aborter via `onAbort`.
+ * Open the mic and keep it open. Every utterance the VAD delimits is handed to `onUtterance`
+ * as PCM and the VAD re-arms itself for the next one — one gesture buys the whole conversation.
  */
-async function captureUtterance(onAbort: (cancel: () => void) => void): Promise<Float32Array | null> {
+async function openMic(onUtterance: (pcm: Float32Array) => void): Promise<MicSession> {
   let stream: MediaStream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -90,71 +97,121 @@ async function captureUtterance(onAbort: (cancel: () => void) => void): Promise<
   const mute = ctx.createGain();
   mute.gain.value = 0;
 
-  return new Promise<Float32Array | null>((resolve) => {
-    const frames: Float32Array[] = [];
-    const vad = new EnergyVad(0);
-    let speechFrame = -1;
-    let settled = false;
+  let frames: Float32Array[] = [];
+  let frameCount = 0; // audio clock; keeps ticking while gated so the VAD's timers stay honest
+  let speechFrame = -1;
+  let stopped = false;
+  const vad = new ContinuousVad(0);
 
-    const finish = (result: Float32Array | null) => {
-      if (settled) return;
-      settled = true;
+  node.onaudioprocess = (e) => {
+    // Time from the audio clock, not Date.now(): a busy main thread can't skew the hangover.
+    const nowMs = ++frameCount * FRAME_MS;
+    if (vad.isGated) return; // her voice is not a turn — see setGated below
+    const buf = e.inputBuffer.getChannelData(0);
+    frames.push(new Float32Array(buf)); // the event's buffer is reused — copy or lose it
+
+    let sumSquares = 0;
+    for (let i = 0; i < buf.length; i++) sumSquares += buf[i] * buf[i];
+
+    switch (vad.push(Math.sqrt(sumSquares / buf.length), nowMs)) {
+      case 'speech':
+        if (speechFrame < 0) speechFrame = frames.length - 1;
+        break;
+      case 'idle':
+        speechFrame = -1; // a blip the VAD threw away — don't keep its position
+        // A mic that stays open all conversation is a memory leak unless the silence is
+        // dropped. Keep only the lead-in the next utterance's first syllable needs.
+        if (frames.length > PRE_ROLL_FRAMES) frames.splice(0, frames.length - PRE_ROLL_FRAMES);
+        break;
+      case 'end': {
+        const from = Math.max(0, speechFrame - PRE_ROLL_FRAMES);
+        const kept = frames.slice(from);
+        const pcm = new Float32Array(kept.length * FRAME_SIZE);
+        kept.forEach((f, i) => pcm.set(f, i * FRAME_SIZE));
+        frames = [];
+        speechFrame = -1;
+        onUtterance(pcm);
+        break;
+      }
+    }
+  };
+
+  source.connect(node);
+  node.connect(mute);
+  mute.connect(ctx.destination);
+
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
       node.onaudioprocess = null;
       node.disconnect();
       mute.disconnect();
       source.disconnect();
       stream.getTracks().forEach((t) => t.stop());
       void ctx.close().catch(() => {});
-      resolve(result);
-    };
-    onAbort(() => finish(null));
-
-    node.onaudioprocess = (e) => {
-      const buf = e.inputBuffer.getChannelData(0);
-      frames.push(new Float32Array(buf)); // the event's buffer is reused — copy or lose it
-      // Time from the audio clock, not Date.now(): a busy main thread can't skew the hangover.
-      const nowMs = frames.length * FRAME_MS;
-
-      let sumSquares = 0;
-      for (let i = 0; i < buf.length; i++) sumSquares += buf[i] * buf[i];
-
-      switch (vad.push(Math.sqrt(sumSquares / buf.length), nowMs)) {
-        case 'speech':
-          if (speechFrame < 0) speechFrame = frames.length - 1;
-          break;
-        case 'listening':
-          speechFrame = -1; // a blip the VAD threw away — don't keep its position
-          break;
-        case 'timeout':
-          return finish(null);
-        case 'end': {
-          const from = Math.max(0, speechFrame - PRE_ROLL_FRAMES);
-          const kept = frames.slice(from);
-          const pcm = new Float32Array(kept.length * FRAME_SIZE);
-          kept.forEach((f, i) => pcm.set(f, i * FRAME_SIZE));
-          return finish(pcm);
-        }
+    },
+    setGated(gated: boolean) {
+      vad.setGated(gated, frameCount * FRAME_MS);
+      // Belt and braces: the track itself goes silent, so this is not merely "we ignore her".
+      stream.getAudioTracks().forEach((t) => (t.enabled = !gated));
+      if (gated) {
+        frames = [];
+        speechFrame = -1;
       }
-    };
-
-    source.connect(node);
-    node.connect(mute);
-    mute.connect(ctx.destination);
-  });
+    },
+  };
 }
 
 export class LocalSpeech {
-  private cancelCapture: (() => void) | null = null;
+  private mic: MicSession | null = null;
   private inFlight: AbortController | null = null;
+  private endSession: ((err?: Error) => void) | null = null;
 
-  /** One utterance: mic in, transcript out. '' means nothing was said. */
-  async listenOnce(): Promise<string> {
-    const pcm = await captureUtterance((cancel) => {
-      this.cancelCapture = cancel;
+  /** Is a hands-free session holding the mic right now? */
+  get active(): boolean {
+    return this.mic !== null;
+  }
+
+  /**
+   * Listen for the whole conversation. Each utterance the VAD delimits is transcribed and
+   * handed to `onText`. Resolves when stop() ends the session; rejects if the transcription
+   * server goes away mid-session, so the caller can fall back to Chrome.
+   */
+  async listen(onText: (text: string) => void): Promise<void> {
+    const finished = new Promise<void>((resolve, reject) => {
+      this.endSession = (err) => (err ? reject(err) : resolve());
     });
-    this.cancelCapture = null;
-    if (!pcm) return '';
+    try {
+      this.mic = await openMic((pcm) => {
+        void this.transcribe(pcm)
+          .then((text) => {
+            if (text) onText(text);
+          })
+          .catch((err) => this.stop(err as Error));
+      });
+    } catch (e) {
+      this.endSession = null;
+      throw e;
+    }
+    return finished;
+  }
 
+  setGated(gated: boolean) {
+    this.mic?.setGated(gated);
+  }
+
+  stop(err?: Error) {
+    this.mic?.stop();
+    this.mic = null;
+    this.inFlight?.abort(); // an aborted fetch lands in listen()'s catch, which calls stop() again — no-op by then
+    this.inFlight = null;
+    const end = this.endSession;
+    this.endSession = null;
+    end?.(err);
+  }
+
+  private async transcribe(pcm: Float32Array): Promise<string> {
     this.inFlight = new AbortController();
     try {
       const res = await fetch(`${config.localStt.serverUrl}/v1/audio/transcriptions`, {
@@ -169,10 +226,5 @@ export class LocalSpeech {
     } finally {
       this.inFlight = null;
     }
-  }
-
-  stop() {
-    this.cancelCapture?.();
-    this.inFlight?.abort();
   }
 }
